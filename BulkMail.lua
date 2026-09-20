@@ -116,7 +116,7 @@ end
 
 local function hasAnySendMailItem()
     for slot = 1, ATTACHMENTS_MAX_SEND do
-        if HasSendMailItem(slot) then
+        if HasSendMailItem(slot) or GetSendMailItem(slot) or GetSendMailItemLink(slot) then
             return true
         end
     end
@@ -125,7 +125,7 @@ end
 
 local function firstSendMailItemSlot()
     for slot = 1, ATTACHMENTS_MAX_SEND do
-        if GetSendMailItem(slot) then
+        if HasSendMailItem(slot) or GetSendMailItem(slot) or GetSendMailItemLink(slot) then
             return slot
         end
     end
@@ -1013,17 +1013,21 @@ BulkMail.PLAYER_ENTERING_WORLD = BulkMail.MAIL_CLOSED  -- MAIL_CLOSED doesn't ge
 
 local ATTACHMENT_CLEAR_RETRY_DELAY = 0.1
 local ATTACHMENT_CLEAR_MAX_ATTEMPTS = 50
+local ATTACHMENT_CLEAR_EMPTY_CONFIRMATIONS = 3
 
-function mod:ScheduleRecipientRestore()
+function mod:ScheduleRecipientRestore(recipient, delay)
+    self._recipientToRestore = recipient or sendDest or self._recipientToRestore
     if not self._recipientRestoreTimer then
-        self._recipientRestoreTimer = self:ScheduleTimer("RestoreBulkRecipient", 0.01)
+        self._recipientRestoreTimer = self:ScheduleTimer("RestoreBulkRecipient", delay or 0.01)
     end
 end
 
 function mod:RestoreBulkRecipient()
     self._recipientRestoreTimer = nil
-    if self._sendingBulk and sendDest and sendDest ~= '' then
-        setRecipientFields(sendDest)
+    local recipient = self._recipientToRestore or sendDest
+    self._recipientToRestore = nil
+    if recipient and recipient ~= '' then
+        setRecipientFields(recipient)
     end
 end
 
@@ -1048,9 +1052,13 @@ function mod:ContinueBulkSendWhenReady()
     if not self._sendingBulk or not self._waitingForAttachmentClear then
         return
     end
+    if sendDest and sendDest ~= '' then
+        setRecipientFields(sendDest)
+    end
 
     if hasAnySendMailItem() then
         self._attachmentClearAttempts = (self._attachmentClearAttempts or 0) + 1
+        self._attachmentClearEmptyConfirmations = 0
         if self._attachmentClearAttempts >= ATTACHMENT_CLEAR_MAX_ATTEMPTS then
             self:StopBulkSend()
             self:Print(L["The mail attachment slots did not clear. Close and reopen the mailbox before retrying."])
@@ -1060,14 +1068,24 @@ function mod:ContinueBulkSendWhenReady()
         return
     end
 
+    self._attachmentClearEmptyConfirmations = (self._attachmentClearEmptyConfirmations or 0) + 1
+    if self._attachmentClearEmptyConfirmations < ATTACHMENT_CLEAR_EMPTY_CONFIRMATIONS then
+        self:ScheduleAttachmentClearCheck()
+        return
+    end
+
     self._waitingForAttachmentClear = nil
     self._attachmentClearAttempts = nil
-    self._attachmentClearTimer = self:ScheduleTimer("ResumeBulkSend", 0.01)
+    self._attachmentClearEmptyConfirmations = nil
+    self._attachmentClearTimer = self:ScheduleTimer("ResumeBulkSend", 0.05)
 end
 
 function mod:ResumeBulkSend()
     self._attachmentClearTimer = nil
     if self._sendingBulk and not self._waitingForAttachmentClear then
+        if sendDest and sendDest ~= '' then
+            setRecipientFields(sendDest)
+        end
         self:Send(self._sendCOD)
     end
 end
@@ -1077,9 +1095,10 @@ function mod:MAIL_SEND_SUCCESS()
         self:RefreshSendQueueGUI()
         -- Blizzard clears the recipient after every successful mail. Restore it
         -- after the frame update so it stays stable throughout the bulk queue.
-        self:ScheduleRecipientRestore()
+        self:ScheduleRecipientRestore(sendDest)
         self._waitingForAttachmentClear = true
         self._attachmentClearAttempts = 0
+        self._attachmentClearEmptyConfirmations = 0
         self:ScheduleAttachmentClearCheck()
     end
 end
@@ -1365,29 +1384,34 @@ function mod:Send(cod)
         return self.hooks[SendMailMailButton].OnClick(SendMailMailButton)
     else
         local completedDest = sendDest
-        self:StopBulkSend()
+        self:StopBulkSend(true)
         sendCacheCleanup()
         if completedDest and completedDest ~= '' then
             setRecipientFields(completedDest)
+            self:ScheduleRecipientRestore(completedDest, 0.2)
         end
         return
     end
 end
 
-function mod:StopBulkSend()
+function mod:StopBulkSend(keepRecipientRestore)
     if self._attachmentClearTimer then
         self:CancelTimer(self._attachmentClearTimer, true)
         self._attachmentClearTimer = nil
     end
-    if self._recipientRestoreTimer then
+    if self._recipientRestoreTimer and not keepRecipientRestore then
         self:CancelTimer(self._recipientRestoreTimer, true)
         self._recipientRestoreTimer = nil
+    end
+    if not keepRecipientRestore then
+        self._recipientToRestore = nil
     end
     cacheLock = false
     self._sendingBulk = false
     self._sendCOD = nil
     self._waitingForAttachmentClear = nil
     self._attachmentClearAttempts = nil
+    self._attachmentClearEmptyConfirmations = nil
     self._bulkMailUsesAutoSubject = nil
     self._bulkMailSubject = nil
 end
