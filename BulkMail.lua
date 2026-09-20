@@ -1031,6 +1031,14 @@ function mod:RestoreBulkRecipient()
     end
 end
 
+function mod:CancelRecipientRestore()
+    if self._recipientRestoreTimer then
+        self:CancelTimer(self._recipientRestoreTimer, true)
+        self._recipientRestoreTimer = nil
+    end
+    self._recipientToRestore = nil
+end
+
 function mod:ScheduleAttachmentClearCheck(delay)
     if not self._attachmentClearTimer then
         self._attachmentClearTimer = self:ScheduleTimer("ContinueBulkSendWhenReady", delay or ATTACHMENT_CLEAR_RETRY_DELAY)
@@ -1250,7 +1258,11 @@ end
 function mod:SendMailNameEditBox_OnTextChanged(frame, a1)
     local currentRecipient = SendMailNameEditBox:GetText()
     local displayedRecipient = currentRecipient
-    if cacheLock then
+    local userChangedRecipient = a1 and not self._updatingRecipient
+    if userChangedRecipient then
+        self:CancelRecipientRestore()
+    end
+    if cacheLock and not userChangedRecipient then
         displayedRecipient = sendDest or currentRecipient
         if self._sendingBulk and displayedRecipient ~= '' and currentRecipient ~= displayedRecipient then
             self:ScheduleRecipientRestore()
@@ -1928,6 +1940,9 @@ local function _createOrAttachRecipientBar(tooltip)
         editBox:SetScript("OnTextChanged", function(self, userInput)
             AutoCompleteEditBox_OnTextChanged(self, userInput)
             if mod._updatingRecipient then return end
+            if userInput then
+                mod:CancelRecipientRestore()
+            end
             mod._updatingRecipient = true
             SendMailNameEditBox:SetText(self:GetText())
             mod._updatingRecipient = nil
