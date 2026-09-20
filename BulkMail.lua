@@ -35,6 +35,7 @@ local fmt = string.format
 local ClickSendMailItemButton = ClickSendMailItemButton
 
 local GetItemInfo = GetItemInfo
+local HasSendMailItem = HasSendMailItem
 local GetSendMailItem = GetSendMailItem
 local GetSendMailItemLink = GetSendMailItemLink
 local GetSendMailPrice = GetSendMailPrice
@@ -354,6 +355,18 @@ local function updateSendCost()
     else
         MoneyFrame_Update('SendMailCostMoneyFrame', GetSendMailPrice())
     end
+end
+
+-- MAIL_SEND_SUCCESS can fire before the client has finished clearing the
+-- attachment slots.  Loading the next batch while any slot is still occupied
+-- leaves stale question-mark attachments in the send-mail frame.
+local function hasSendMailItems()
+    for slot = 1, ATTACHMENTS_MAX_SEND do
+        if HasSendMailItem(slot) then
+            return true
+        end
+    end
+    return false
 end
 
 local function findPattern (str, pattern)
@@ -912,6 +925,7 @@ function mod:MAIL_SHOW()
         self:RawHookScript(MailFrameTab1, 'OnClick', 'MailFrameTab1_OnClick')
         self:RawHookScript(MailFrameTab2, 'OnClick', 'MailFrameTab2_OnClick')
         self:RawHookScript(SendMailNameEditBox, 'OnTextChanged', 'SendMailNameEditBox_OnTextChanged')
+        self:RegisterEvent('MAIL_SEND_INFO_UPDATE')
         self:RegisterEvent('MAIL_SEND_SUCCESS')
         self:RegisterEvent('SECURE_TRANSFER_CANCEL')
         self:RegisterEvent('MAIL_FAILED')
@@ -982,9 +996,35 @@ BulkMail.PLAYER_ENTERING_WORLD = BulkMail.MAIL_CLOSED  -- MAIL_CLOSED doesn't ge
 function mod:MAIL_SEND_SUCCESS()
     if self._sendingBulk then
         self:RefreshSendQueueGUI()
-        -- Small delay to let WoW process the sent mail before loading the next one
-        self:ScheduleTimer("Send", 0.1, self._sendCOD)
+        self._waitingForMailSlots = true
+        self:ScheduleBulkSendContinuation(0.1)
     end
+end
+
+function mod:MAIL_SEND_INFO_UPDATE()
+    if self._sendingBulk and self._waitingForMailSlots and not hasSendMailItems() then
+        self:ScheduleBulkSendContinuation(0)
+    end
+end
+
+function mod:ScheduleBulkSendContinuation(delay)
+    if self._bulkSendTimer then
+        self:CancelTimer(self._bulkSendTimer, true)
+    end
+    self._bulkSendTimer = self:ScheduleTimer("ContinueBulkSend", delay)
+end
+
+function mod:ContinueBulkSend()
+    self._bulkSendTimer = nil
+    if not self._sendingBulk or not self._waitingForMailSlots then
+        return
+    end
+    if hasSendMailItems() then
+        self:ScheduleBulkSendContinuation(0.1)
+        return
+    end
+    self._waitingForMailSlots = nil
+    self:Send(self._sendCOD)
 end
 
 function mod:SECURE_TRANSFER_CANCEL()
@@ -1202,6 +1242,11 @@ function mod:Send(cod)
 end
 
 function mod:StopBulkSend()
+    if self._bulkSendTimer then
+        self:CancelTimer(self._bulkSendTimer, true)
+        self._bulkSendTimer = nil
+    end
+    self._waitingForMailSlots = nil
     cacheLock = false
     self._sendingBulk = false
     self._sendCOD = nil
