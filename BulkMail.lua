@@ -131,6 +131,19 @@ local function firstSendMailItemSlot()
     end
 end
 
+local function setRecipientFields(recipient)
+    recipient = recipient or ''
+    sendDest = recipient
+    mod._updatingRecipient = true
+    if SendMailNameEditBox:GetText() ~= recipient then
+        SendMailNameEditBox:SetText(recipient)
+    end
+    if mod._recipientBar and mod._recipientBar.editBox and mod._recipientBar.editBox:GetText() ~= recipient then
+        mod._recipientBar.editBox:SetText(recipient)
+    end
+    mod._updatingRecipient = nil
+end
+
 --[[----------------------------------------------------------------------------
 Table Handling
 ------------------------------------------------------------------------------]]
@@ -1001,6 +1014,19 @@ BulkMail.PLAYER_ENTERING_WORLD = BulkMail.MAIL_CLOSED  -- MAIL_CLOSED doesn't ge
 local ATTACHMENT_CLEAR_RETRY_DELAY = 0.1
 local ATTACHMENT_CLEAR_MAX_ATTEMPTS = 50
 
+function mod:ScheduleRecipientRestore()
+    if not self._recipientRestoreTimer then
+        self._recipientRestoreTimer = self:ScheduleTimer("RestoreBulkRecipient", 0.01)
+    end
+end
+
+function mod:RestoreBulkRecipient()
+    self._recipientRestoreTimer = nil
+    if self._sendingBulk and sendDest and sendDest ~= '' then
+        setRecipientFields(sendDest)
+    end
+end
+
 function mod:ScheduleAttachmentClearCheck(delay)
     if not self._attachmentClearTimer then
         self._attachmentClearTimer = self:ScheduleTimer("ContinueBulkSendWhenReady", delay or ATTACHMENT_CLEAR_RETRY_DELAY)
@@ -1049,6 +1075,9 @@ end
 function mod:MAIL_SEND_SUCCESS()
     if self._sendingBulk then
         self:RefreshSendQueueGUI()
+        -- Blizzard clears the recipient after every successful mail. Restore it
+        -- after the frame update so it stays stable throughout the bulk queue.
+        self:ScheduleRecipientRestore()
         self._waitingForAttachmentClear = true
         self._attachmentClearAttempts = 0
         self:ScheduleAttachmentClearCheck()
@@ -1200,12 +1229,21 @@ function mod:MailFrameTab2_OnClick(frame, a1)
 end
 
 function mod:SendMailNameEditBox_OnTextChanged(frame, a1)
-    sendDest = cacheLock and sendDest or SendMailNameEditBox:GetText()
-    sendCacheBuild(SendMailNameEditBox:GetText())
+    local currentRecipient = SendMailNameEditBox:GetText()
+    local displayedRecipient = currentRecipient
+    if cacheLock then
+        displayedRecipient = sendDest or currentRecipient
+        if self._sendingBulk and displayedRecipient ~= '' and currentRecipient ~= displayedRecipient then
+            self:ScheduleRecipientRestore()
+        end
+    elseif not self._updatingRecipient then
+        sendDest = currentRecipient
+        sendCacheBuild(currentRecipient)
+    end
     -- Sync recipient bar if it wasn't the source of the change
-    if not mod._updatingRecipient and mod._recipientBar and mod._recipientBar.editBox and mod._recipientBar.editBox:GetText() ~= SendMailNameEditBox:GetText() then
+    if not mod._updatingRecipient and mod._recipientBar and mod._recipientBar.editBox and mod._recipientBar.editBox:GetText() ~= displayedRecipient then
         mod._updatingRecipient = true
-        mod._recipientBar.editBox:SetText(SendMailNameEditBox:GetText())
+        mod._recipientBar.editBox:SetText(displayedRecipient)
         mod._updatingRecipient = nil
     end
     return self.hooks[frame].OnTextChanged(frame, a1)
@@ -1257,7 +1295,7 @@ end
 function mod:Send(cod)
     local attachedSlot = firstSendMailItemSlot()
     if attachedSlot then
-        SendMailNameEditBox:SetText((sendDest ~= '' and sendDest or rulesCacheDest(GetSendMailItemLink(attachedSlot)) or self.db.char.defaultDestination) or '')
+        setRecipientFields((sendDest ~= '' and sendDest or rulesCacheDest(GetSendMailItemLink(attachedSlot)) or self.db.char.defaultDestination) or '')
         if SendMailNameEditBox:GetText() ~= '' then
             advanceSubjectSuffix()
             _G.this = SendMailMailButton
@@ -1322,15 +1360,17 @@ function mod:Send(cod)
             MoneyInputFrame_SetCopper(SendMailMoney, cod)
         end
         -- Items are now in the mail slots; set destination and trigger the actual send
-        sendDest = dest
-        SendMailNameEditBox:SetText(dest)
+        setRecipientFields(dest)
         _G.this = SendMailMailButton
         return self.hooks[SendMailMailButton].OnClick(SendMailMailButton)
     else
-        SendMailNameEditBox:SetText('')
-        sendDest = ''
+        local completedDest = sendDest
         self:StopBulkSend()
-        return sendCacheCleanup()
+        sendCacheCleanup()
+        if completedDest and completedDest ~= '' then
+            setRecipientFields(completedDest)
+        end
+        return
     end
 end
 
@@ -1338,6 +1378,10 @@ function mod:StopBulkSend()
     if self._attachmentClearTimer then
         self:CancelTimer(self._attachmentClearTimer, true)
         self._attachmentClearTimer = nil
+    end
+    if self._recipientRestoreTimer then
+        self:CancelTimer(self._recipientRestoreTimer, true)
+        self._recipientRestoreTimer = nil
     end
     cacheLock = false
     self._sendingBulk = false
