@@ -35,6 +35,7 @@ local fmt = string.format
 local ClickSendMailItemButton = ClickSendMailItemButton
 
 local GetItemInfo = GetItemInfo
+local HasSendMailItem = HasSendMailItem
 local GetSendMailItem = GetSendMailItem
 local GetSendMailItemLink = GetSendMailItemLink
 local GetSendMailPrice = GetSendMailPrice
@@ -111,6 +112,23 @@ if not GetContainerNumSlots then
         item.hyperLink, item.isFiltered, item.hasNoValue, item.itemID, item.isBound
     end
     PickupContainerItem = C_Container.PickupContainerItem
+end
+
+local function hasAnySendMailItem()
+    for slot = 1, ATTACHMENTS_MAX_SEND do
+        if HasSendMailItem(slot) then
+            return true
+        end
+    end
+    return false
+end
+
+local function firstSendMailItemSlot()
+    for slot = 1, ATTACHMENTS_MAX_SEND do
+        if GetSendMailItem(slot) then
+            return slot
+        end
+    end
 end
 
 --[[----------------------------------------------------------------------------
@@ -913,6 +931,7 @@ function mod:MAIL_SHOW()
         self:RawHookScript(MailFrameTab2, 'OnClick', 'MailFrameTab2_OnClick')
         self:RawHookScript(SendMailNameEditBox, 'OnTextChanged', 'SendMailNameEditBox_OnTextChanged')
         self:RegisterEvent('MAIL_SEND_SUCCESS')
+        self:RegisterEvent('MAIL_SEND_INFO_UPDATE')
         self:RegisterEvent('SECURE_TRANSFER_CANCEL')
         self:RegisterEvent('MAIL_FAILED')
 
@@ -979,11 +998,60 @@ end
 
 BulkMail.PLAYER_ENTERING_WORLD = BulkMail.MAIL_CLOSED  -- MAIL_CLOSED doesn't get called if, for example, the player accepts a port with the mail window open
 
+local ATTACHMENT_CLEAR_RETRY_DELAY = 0.1
+local ATTACHMENT_CLEAR_MAX_ATTEMPTS = 50
+
+function mod:ScheduleAttachmentClearCheck(delay)
+    if not self._attachmentClearTimer then
+        self._attachmentClearTimer = self:ScheduleTimer("ContinueBulkSendWhenReady", delay or ATTACHMENT_CLEAR_RETRY_DELAY)
+    end
+end
+
+function mod:MAIL_SEND_INFO_UPDATE()
+    if self._sendingBulk and self._waitingForAttachmentClear then
+        if self._attachmentClearTimer then
+            self:CancelTimer(self._attachmentClearTimer, true)
+            self._attachmentClearTimer = nil
+        end
+        self:ScheduleAttachmentClearCheck(0.01)
+    end
+end
+
+function mod:ContinueBulkSendWhenReady()
+    self._attachmentClearTimer = nil
+    if not self._sendingBulk or not self._waitingForAttachmentClear then
+        return
+    end
+
+    if hasAnySendMailItem() then
+        self._attachmentClearAttempts = (self._attachmentClearAttempts or 0) + 1
+        if self._attachmentClearAttempts >= ATTACHMENT_CLEAR_MAX_ATTEMPTS then
+            self:StopBulkSend()
+            self:Print(L["The mail attachment slots did not clear. Close and reopen the mailbox before retrying."])
+            return
+        end
+        self:ScheduleAttachmentClearCheck()
+        return
+    end
+
+    self._waitingForAttachmentClear = nil
+    self._attachmentClearAttempts = nil
+    self._attachmentClearTimer = self:ScheduleTimer("ResumeBulkSend", 0.01)
+end
+
+function mod:ResumeBulkSend()
+    self._attachmentClearTimer = nil
+    if self._sendingBulk and not self._waitingForAttachmentClear then
+        self:Send(self._sendCOD)
+    end
+end
+
 function mod:MAIL_SEND_SUCCESS()
     if self._sendingBulk then
         self:RefreshSendQueueGUI()
-        -- Small delay to let WoW process the sent mail before loading the next one
-        self:ScheduleTimer("Send", 0.1, self._sendCOD)
+        self._waitingForAttachmentClear = true
+        self._attachmentClearAttempts = 0
+        self:ScheduleAttachmentClearCheck()
     end
 end
 
@@ -1041,7 +1109,7 @@ end
 
 
 function mod:SendMailFrame_CanSend()
-    if sendCache and next(sendCache) or GetSendMailItem(1) or SendMailSendMoneyButton:GetChecked() and MoneyInputFrame_GetCopper(SendMailMoney) > 0 then
+    if sendCache and next(sendCache) or hasAnySendMailItem() or SendMailSendMoneyButton:GetChecked() and MoneyInputFrame_GetCopper(SendMailMoney) > 0 then
         SendMailMailButton:Enable()
         SendMailCODButton:Enable()
     end
@@ -1085,7 +1153,19 @@ function mod:SendMailMailButton_OnClick(frame, a1)
     end
     sendDest = SendMailNameEditBox:GetText()
     self._sendCOD = SendMailCODButton:GetChecked() and MoneyInputFrame_GetCopper(SendMailMoney)
-    if GetSendMailItem(1) or sendCache and next(sendCache) then
+    if hasAnySendMailItem() or sendCache and next(sendCache) then
+        local subject = SendMailSubjectEditBox:GetText()
+        local previousItem = SendMailFrame and SendMailFrame.previousItem or ''
+        local automaticSubject = subject == '' or subject == previousItem or subject == self._lastAutomaticSubject
+        if not automaticSubject and previousItem ~= '' and strsub(subject, 1, strlen(previousItem)) == previousItem then
+            automaticSubject = strmatch(strsub(subject, strlen(previousItem) + 1), '^%s*$') ~= nil
+        end
+        self._bulkMailUsesAutoSubject = automaticSubject
+        if automaticSubject then
+            self._bulkMailSubject = nil
+        else
+            self._bulkMailSubject = subject
+        end
         organizeSendCache()
         self._sendingBulk = true
         self:Send(self._sendCOD)
@@ -1157,11 +1237,29 @@ end
 -- destination (or the default if that field is blank), then supplies items and
 -- destinations from BulkMail's send queue and sends them.
 local suffix = SUFFIX_CHAR  -- for ensuring subject uniqueness to help BMI's "selected item" features
+local function advanceSubjectSuffix()
+    if #suffix > 10 then
+        suffix = SUFFIX_CHAR
+    else
+        suffix = suffix..SUFFIX_CHAR
+    end
+end
+
+local function formatItemSubject(itemName, itemCount)
+    if not itemName then
+        return ''
+    elseif itemCount and itemCount > 1 then
+        return fmt('%s (%d)', itemName, itemCount)
+    end
+    return itemName
+end
+
 function mod:Send(cod)
-    if GetSendMailItem(1) then
-        SendMailNameEditBox:SetText((sendDest ~= '' and sendDest or rulesCacheDest(GetSendMailItemLink(1)) or self.db.char.defaultDestination) or '')
+    local attachedSlot = firstSendMailItemSlot()
+    if attachedSlot then
+        SendMailNameEditBox:SetText((sendDest ~= '' and sendDest or rulesCacheDest(GetSendMailItemLink(attachedSlot)) or self.db.char.defaultDestination) or '')
         if SendMailNameEditBox:GetText() ~= '' then
-            if #suffix > 10 then suffix = SUFFIX_CHAR else suffix = suffix..SUFFIX_CHAR end
+            advanceSubjectSuffix()
             _G.this = SendMailMailButton
             return self.hooks[SendMailMailButton].OnClick(SendMailMailButton)
         elseif not self.db.char.defaultDestination then
@@ -1172,17 +1270,53 @@ function mod:Send(cod)
         end
         return
     end
+    if hasAnySendMailItem() then
+        self._waitingForAttachmentClear = true
+        self._attachmentClearAttempts = 0
+        self:ScheduleAttachmentClearCheck()
+        return
+    end
     if destSendCache and next(destSendCache) then
         local dest, bagslots = next(destSendCache)
-        local bag, slot
+        local bag, slot, firstItemID, firstItemName, firstStackCount, identicalItemCount
+        local batchAttachmentCount = 0
+        local allItemsIdentical = true
         for i=1, min(self.db.char.attachMulti and ATTACHMENTS_MAX_SEND or 1, #bagslots) do
             bag, slot = unpack(tremove(bagslots))
+            local itemLink = GetContainerItemLink(bag, slot)
+            local itemID = itemLink and linkToId(itemLink)
+            local itemName = itemLink and GetItemInfo(itemLink)
+            local stackCount = select(2, GetContainerItemInfo(bag, slot)) or 1
+            if batchAttachmentCount == 0 then
+                firstItemID = itemID
+                firstItemName = itemName
+                firstStackCount = stackCount
+                identicalItemCount = stackCount
+            elseif itemID == firstItemID then
+                identicalItemCount = identicalItemCount + stackCount
+            else
+                allItemsIdentical = false
+            end
+            batchAttachmentCount = batchAttachmentCount + 1
             PickupContainerItem(bag, slot)
             ClickSendMailItemButton(i)
         end
         destSendCache[dest] = next(bagslots) and bagslots or del(bagslots)
 
-        SendMailSubjectEditBox:SetText(SendMailSubjectEditBox:GetText()..suffix)
+        if not firstItemName then
+            firstItemName = GetSendMailItem(1)
+            firstStackCount = select(4, GetSendMailItem(1)) or firstStackCount
+        end
+        local subject = self._bulkMailSubject
+        if self._bulkMailUsesAutoSubject then
+            subject = formatItemSubject(firstItemName, allItemsIdentical and identicalItemCount or firstStackCount)
+        end
+        local uniqueSubject = (subject or '')..suffix
+        SendMailSubjectEditBox:SetText(uniqueSubject)
+        if self._bulkMailUsesAutoSubject then
+            self._lastAutomaticSubject = uniqueSubject
+        end
+        advanceSubjectSuffix()
         if cod then
             SendMailSendMoneyButton:SetChecked(nil)
             MoneyInputFrame_SetCopper(SendMailMoney, cod)
@@ -1190,21 +1324,28 @@ function mod:Send(cod)
         -- Items are now in the mail slots; set destination and trigger the actual send
         sendDest = dest
         SendMailNameEditBox:SetText(dest)
-        if #suffix > 10 then suffix = SUFFIX_CHAR else suffix = suffix..SUFFIX_CHAR end
         _G.this = SendMailMailButton
         return self.hooks[SendMailMailButton].OnClick(SendMailMailButton)
     else
         SendMailNameEditBox:SetText('')
         sendDest = ''
-        self._sendingBulk = false
+        self:StopBulkSend()
         return sendCacheCleanup()
     end
 end
 
 function mod:StopBulkSend()
+    if self._attachmentClearTimer then
+        self:CancelTimer(self._attachmentClearTimer, true)
+        self._attachmentClearTimer = nil
+    end
     cacheLock = false
     self._sendingBulk = false
     self._sendCOD = nil
+    self._waitingForAttachmentClear = nil
+    self._attachmentClearAttempts = nil
+    self._bulkMailUsesAutoSubject = nil
+    self._bulkMailSubject = nil
 end
 
 -- Send the container slot's item immediately to its autosend destination
